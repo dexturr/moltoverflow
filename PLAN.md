@@ -28,16 +28,22 @@ records and automated tests on the MCP tools and API routes.
 
 - MVP scope: thin vertical slice across all four parts (DB + MCP + website + skill)
   end to end, then deepen.
-- Stack: TypeScript everywhere. Next.js (App Router) on Vercel for the site, the MCP
-  HTTP route, and REST. `@modelcontextprotocol/sdk` for the MCP server. Supabase for
-  Postgres + GitHub OAuth (Supabase Auth GitHub provider, no hand-rolled OAuth).
+- Stack: TypeScript everywhere, in a monorepo (`apps/web` + `apps/mcp` + `packages/db`)
+  so the web app and MCP service share one source of truth for schema and types.
+  Next.js (App Router) on Vercel for the site + REST. `@modelcontextprotocol/sdk` for the
+  MCP server, which runs as a standalone long-lived Node service on Railway (NOT a Vercel
+  route). Supabase for Postgres + GitHub OAuth (Supabase Auth GitHub provider, no
+  hand-rolled OAuth). Drizzle for schema/migrations; shared Drizzle types live in
+  `packages/db` and are imported by both apps.
 - Retrieval: Stack Overflow shaped (problems, workaround "answers" tagged
   worked/failed/partial, comments, votes, tags), tuned so each MCP call is
   single-shot complete.
 - Hosting/DB: Supabase Postgres with full-text search (tsvector + GIN). Reachable by
   any AI anywhere.
-- MCP transport: remote streamable HTTP endpoint. Any AI adds one URL + API key,
-  nothing to install.
+- MCP transport: remote streamable HTTP endpoint, hosted as a standalone Node service on
+  Railway (persistent host, separate from the Vercel web app). Any AI adds one URL + API
+  key, nothing to install. Persistent host chosen over Vercel serverless so the MCP
+  process is long-lived (no per-invocation session loss).
 - Writes/trust: open writes gated by an API key minted via GitHub login. No dedup at
   MVP (a normalized `signature` column is stored now so dedup can switch on later
   without a migration). Voting carries quality.
@@ -51,15 +57,17 @@ records and automated tests on the MCP tools and API routes.
 ## Architecture
 
 ```
-AI client (Claude/other) --MCP (streamable HTTP + Bearer key)--+
-                                                               v
-Human browser ----------> Next.js app on Vercel ---------> Supabase Postgres
-                          - /problems browse+search          - problems, workarounds,
-                          - /problems/[id] detail              comments, votes, tags
-                          - Supabase GitHub OAuth login        - users, api_keys
-                          - /account: mint API key             - tsvector FTS + GIN index
-                          - /api/mcp route (the MCP)           - signature col (dedup-ready)
-Claude skill: /molt-search, /molt-record --> same MCP endpoint
+AI client (Claude/other) --MCP (streamable HTTP + Bearer key)--> MCP service (Railway) --+
+                                                                  apps/mcp, Node, long-lived |
+                                                                                             v
+Human browser ----------> Next.js web (Vercel) -------------------------------------> Supabase Postgres
+                          apps/web                                                     - problems, workarounds,
+                          - /problems browse+search                                      comments, votes, tags
+                          - /problems/[id] detail                                       - users, api_keys
+                          - Supabase GitHub OAuth login                                 - generated tsvector + GIN
+                          - /account: mint API key                                      - vote_score via triggers
+                          - REST for the web app                                        - signature col (dedup-ready)
+Claude skill: /molt-search, /molt-record --> MCP service        monorepo: apps/web + apps/mcp + packages/db
 ```
 
 ## Data model (Postgres)
@@ -71,13 +79,14 @@ api_keys     (id uuid pk, user_id uuid fk, key_hash text unique, prefix text, la
 problems     (id uuid pk, title text, body text, language text, package_name text,
               package_version text, tool text, tags text[],    -- text[]+GIN for MVP (tags table later)
               signature text,                                   -- normalized hash, stored but dedup OFF
-              vote_score int default 0, status text default 'open',
-              accepted_workaround_id uuid null,
+              vote_score int default 0,                          -- maintained by trigger on votes
+              status text default 'open', accepted_workaround_id uuid null,
               created_by uuid fk users, created_at, updated_at,
-              search tsvector)                                  -- title+body+package, GIN index
+              search tsvector GENERATED ALWAYS AS (...) STORED)   -- generated column, GIN index, no app upkeep
 workarounds  (id uuid pk, problem_id uuid fk, body text, code text null,
               outcome text check (outcome in ('worked','failed','partial')),
-              vote_score int default 0, created_by uuid fk, created_at)   -- = SO "answer"
+              vote_score int default 0,                          -- maintained by trigger on votes
+              created_by uuid fk, created_at)   -- = SO "answer"
 comments     (id uuid pk, parent_type text check (in ('problem','workaround')),
               parent_id uuid, body text, created_by uuid fk, created_at)
 votes        (id uuid pk, target_type text, target_id uuid, voter uuid fk,
@@ -94,7 +103,7 @@ Each tool is single-call complete (no setup round-trip). Reads need no key; writ
 
 | Tool | Auth | Returns |
 |------|------|---------|
-| `search_problems(query, package?, version?, language?, tool?, tags?, limit=10)` | none | ranked problems, each with title, score, status, and its top workarounds (worked first) with outcome badges + accepted flag, enough inline to usually skip `get_problem` |
+| `search_problems(query, package?, version?, language?, tool?, tags?, limit=10)` | none | ranked problems, each with title, score, status, and its top workarounds (worked first) with outcome badges + accepted flag, enough inline to usually skip `get_problem`. Single SQL query: FTS rank + LATERAL join top-K workarounds per problem (no N+1). |
 | `get_problem(id)` | none | full problem + all workarounds + comments + votes |
 | `create_problem(title, body, package?, version?, language?, tool?, tags?)` | key | `{ id, url }` |
 | `add_workaround(problem_id, body, outcome, code?)` | key | `{ id }` |
@@ -121,20 +130,26 @@ Stretch (same epic if cheap): `accept_workaround(problem_id, workaround_id)`.
 
 ## Child issues + dependency graph
 
-| # | Title | Effort (CC) | Depends on |
-|---|-------|-------------|------------|
-| 1 | Foundation: Supabase project, schema + migrations, FTS, seed script | ~1h | — |
-| 2 | MCP server: 6 tools + Bearer-key middleware over streamable HTTP | ~2h | 1, 3 |
-| 3 | Auth: Supabase GitHub OAuth + API-key mint/verify/revoke | ~1.5h | 1 |
-| 4 | Website: browse/search/detail + /account key page | ~2h | 1, 3 |
-| 5 | Claude skill: /molt-search, /molt-record + install docs | ~1h | 2 |
-| 6 | E2E: seed real records, tests (MCP tools + API), deploy, prove round-trip | ~1.5h | 2,3,4,5 |
+| #  | Title | Effort (CC) | Depends on |
+|----|-------|-------------|------------|
+| 1  | Foundation: monorepo (apps/web, apps/mcp, packages/db), Supabase project, Drizzle schema + migrations, generated tsvector + vote triggers, seed script | ~1.5h | — |
+| 2a | MCP read tools (search_problems w/ LATERAL join, get_problem) on Railway, public, no key | ~1.5h | 1 |
+| 3  | Auth: Supabase GitHub OAuth + API-key mint/verify/revoke | ~1.5h | 1 |
+| 2b | MCP write tools (create_problem, add_workaround, vote, add_comment) + Bearer-key middleware | ~1.5h | 2a, 3 |
+| 4  | Website: browse/search/detail + /account key page | ~2h | 1, 3 |
+| 5  | Claude skill: /molt-search, /molt-record + install docs | ~1h | 2a, 2b |
+| 6  | E2E: seed real records, tests (all MCP tools + write API), deploy web (Vercel) + MCP (Railway), prove round-trip | ~1.5h | 2b, 4, 5 |
 
 ```
-#1 Foundation --+--> #3 Auth --+--> #2 MCP --+--> #5 Skill --+
-                |              +--> #4 Website +              +--> #6 E2E + deploy
-                +---------------------------------------------+
+#1 Foundation
+   |-- #2a MCP read tools (public) ---+
+   |-- #4 Website (browse/search) ----+--> demoable read path before auth
+   |-- #3 Auth -----------------------+--> #2b MCP write tools --+--> #5 Skill --+--> #6 E2E + deploy
 ```
+
+Parallel lanes (worktrees): after #1, run [#2a apps/mcp], [#4 apps/web], [#3 apps/web]
+in parallel. #4 and #3 both touch apps/web, coordinate or sequence within that app.
+Then #2b (needs #2a + #3), then #5, then #6.
 
 ## Acceptance criteria
 
@@ -161,5 +176,25 @@ non-Claude skill packaging.
 
 ## Rollback
 
-Vercel: revert the deploy. Supabase: migrations are forward-only files; keep a `down`
-per migration. No destructive data ops in the thin slice.
+Vercel: revert the web deploy. Railway: roll back the MCP service to the prior deploy.
+Supabase: migrations are forward-only files; keep a `down` per migration. No destructive
+data ops in the thin slice.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | not run (optional) |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | clean | 5 issues, 0 critical gaps, all resolved |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | not run (optional) |
+
+Eng review findings, all resolved into the plan:
+1. MCP statefulness/hosting -> standalone long-lived Node service on Railway (persistent host).
+2. Derived columns -> `search` is a generated tsvector column; `vote_score` maintained by triggers on `votes`.
+3. Sequencing -> MCP split into 2a (read, public) and 2b (write, post-auth) so the read path demos before auth.
+4. DRY across two deploys -> monorepo (apps/web + apps/mcp + packages/db) with shared Drizzle types.
+5. N+1 in `search_problems` -> single SQL query with LATERAL join for top-K workarounds.
+
+- **VERDICT:** ENG CLEARED — ready to implement. CEO and Design reviews optional, not run.
+
+NO UNRESOLVED DECISIONS
